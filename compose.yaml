@@ -1,0 +1,10 @@
+services:
+  bronze:
+    build: .
+    image: cf-bsky-bronze:dev
+    env_file:
+      - path: .env
+        required: false
+    restart: unless-stopped
+    mem_limit: 1g
+    memswap_limit: 1g

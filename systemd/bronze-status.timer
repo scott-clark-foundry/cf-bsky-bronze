@@ -1,0 +1,10 @@
+[Unit]
+Description=Bronze ingest status snapshot timer
+
+[Timer]
+OnBootSec=60s
+OnUnitActiveSec=600s
+Unit=bronze-status.service
+
+[Install]
+WantedBy=timers.target

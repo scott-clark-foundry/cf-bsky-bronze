@@ -1,0 +1,194 @@
+#!/usr/bin/env bash
+# bronze-status — emit one JSONL line of bronze container + S3 state to stdout
+# and append to ${BRONZE_STATUS_LOG:-/var/log/bronze-status.jsonl}.
+#
+# Container metrics come from `docker stats` / `docker inspect`. S3 metrics
+# come from `docker exec <container> python -m bluesky_ingest.s3_status`,
+# which reuses the writer's existing boto3 + Config plumbing — no host-level
+# `aws` CLI dependency, and the host's env never needs S3 credentials.
+#
+# All fields have safe fallbacks: null (or false/0 for booleans/counts) when
+# the container is absent or stopped.
+
+CONTAINER="${BRONZE_CONTAINER_NAME:-bronze}"
+S3_LOG="${BRONZE_STATUS_LOG:-/var/log/bronze-status.jsonl}"
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+# Parse a docker MemUsage string like "150.5MiB / 1GiB" → bytes integer.
+# Returns empty string on any parse failure.
+parse_mem_bytes() {
+    local raw="$1"
+    # Extract left side of " / "
+    local left
+    left="$(echo "$raw" | awk -F' / ' '{print $1}' | tr -d ' ')"
+    if [ -z "$left" ]; then
+        echo ""
+        return
+    fi
+    # Extract numeric value and unit
+    local val unit
+    val="$(echo "$left" | sed 's/[^0-9.]//g')"
+    unit="$(echo "$left" | sed 's/[0-9.]//g' | tr '[:lower:]' '[:upper:]')"
+    if [ -z "$val" ] || [ -z "$unit" ]; then
+        echo ""
+        return
+    fi
+    # Multiply by unit factor using awk
+    local factor
+    case "$unit" in
+        KIB) factor=1024 ;;
+        MIB) factor=1048576 ;;
+        GIB) factor=1073741824 ;;
+        TIB) factor=1099511627776 ;;
+        KB)  factor=1000 ;;
+        MB)  factor=1000000 ;;
+        GB)  factor=1000000000 ;;
+        TB)  factor=1000000000000 ;;
+        B)   factor=1 ;;
+        *)   echo ""; return ;;
+    esac
+    awk "BEGIN { printf \"%d\", $val * $factor }"
+}
+
+# Strip trailing % from a docker percent string like "14.7%".
+strip_pct() {
+    echo "$1" | tr -d '%' | tr -d ' '
+}
+
+# ---------------------------------------------------------------------------
+# Container metrics
+# ---------------------------------------------------------------------------
+mem_usage_bytes="null"
+mem_pct="null"
+cpu_pct="null"
+restart_count="null"
+oom_killed="false"
+
+if command -v docker &>/dev/null; then
+    # docker stats (non-stream) — may fail if container absent or stopped
+    stats_json="$(docker stats "$CONTAINER" --no-stream --format '{{json .}}' 2>/dev/null || true)"
+
+    if [ -n "$stats_json" ]; then
+        raw_mem="$(echo "$stats_json" | jq -r '.MemUsage // ""' 2>/dev/null || true)"
+        raw_mem_pct="$(echo "$stats_json" | jq -r '.MemPerc // ""' 2>/dev/null || true)"
+        raw_cpu="$(echo "$stats_json" | jq -r '.CPUPerc // ""' 2>/dev/null || true)"
+
+        parsed_bytes="$(parse_mem_bytes "$raw_mem")"
+        if [ -n "$parsed_bytes" ]; then
+            mem_usage_bytes="$parsed_bytes"
+        fi
+
+        if [ -n "$raw_mem_pct" ]; then
+            mem_pct="$(strip_pct "$raw_mem_pct")"
+        fi
+
+        if [ -n "$raw_cpu" ]; then
+            cpu_pct="$(strip_pct "$raw_cpu")"
+        fi
+    fi
+
+    # docker inspect — may fail if container absent
+    inspect_restart="$(docker inspect "$CONTAINER" --format '{{.RestartCount}}' 2>/dev/null || true)"
+    if [ -n "$inspect_restart" ]; then
+        restart_count="$inspect_restart"
+    fi
+
+    inspect_oom="$(docker inspect "$CONTAINER" --format '{{.State.OOMKilled}}' 2>/dev/null || true)"
+    if [ "$inspect_oom" = "true" ]; then
+        oom_killed="true"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# S3 metrics — read via boto3 from inside the bronze container.
+# The container holds the S3 credentials in its env (compose env_file);
+# the host never needs them. Output: "<count>\t<newest_filename>".
+# ---------------------------------------------------------------------------
+s3_file_count="null"
+s3_newest_file=""
+
+if command -v docker &>/dev/null; then
+    s3_info="$(docker exec "$CONTAINER" python -m bluesky_ingest.s3_status 2>/dev/null || true)"
+    if [ -n "$s3_info" ]; then
+        s3_file_count="$(printf '%s' "$s3_info" | cut -f1)"
+        s3_newest_file="$(printf '%s' "$s3_info" | cut -f2)"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# Log-derived metrics from docker logs.
+#
+# We read batch-flush events (batch_full and batch_written) rather than the
+# per-iter run_complete event for liveness signal: at firehose load batches
+# flush every ~1-5s, while run_complete fires only at iter exit (every
+# MAX_RUN_SECONDS or on idle). Reading batches gives a high-resolution
+# "is the writer making progress" indicator that fits a 60s sample window.
+# ---------------------------------------------------------------------------
+last_batch_ts=""
+batch_count="0"
+put_fail_count="0"
+
+if command -v docker &>/dev/null && command -v jq &>/dev/null; then
+    # Test if container exists at all (inspect works on stopped containers too)
+    if docker inspect "$CONTAINER" &>/dev/null 2>&1; then
+        logs_24h="$(docker logs "$CONTAINER" --since 24h 2>&1 || true)"
+        logs_60s="$(docker logs "$CONTAINER" --since 60s 2>&1 || true)"
+
+        # last batch flush timestamp (batch_full or batch_written, whichever is newer)
+        last_batch_ts="$(echo "$logs_24h" | jq -rs 'map(select(type=="object" and (.event=="batch_full" or .event=="batch_written"))) | if length>0 then .[-1].timestamp else null end' 2>/dev/null || true)"
+        # jq outputs "null" (the string) when no match — normalise to empty
+        if [ "$last_batch_ts" = "null" ]; then
+            last_batch_ts=""
+        fi
+
+        # count batch flush events (full or sub-full) in last 60s.
+        # `jq -r select(...) | wc -l` counts matches because structlog's
+        # JSONRenderer emits one object per line — if that ever switches to
+        # indented JSON, this count would inflate (one match → many lines).
+        batch_count="$(echo "$logs_60s" | jq -r 'select(type=="object" and (.event=="batch_full" or .event=="batch_written"))' 2>/dev/null | wc -l | tr -d ' ' || echo "0")"
+
+        # count s3_put_failed events in last 60s
+        put_fail_count="$(echo "$logs_60s" | jq -r 'select(type=="object" and .event=="s3_put_failed")' 2>/dev/null | wc -l | tr -d ' ' || echo "0")"
+    fi
+fi
+
+# Ensure counts are integers (wc -l may produce whitespace or unexpected output)
+batch_count="${batch_count//[^0-9]/}"
+put_fail_count="${put_fail_count//[^0-9]/}"
+batch_count="${batch_count:-0}"
+put_fail_count="${put_fail_count:-0}"
+
+# ---------------------------------------------------------------------------
+# Build JSONL line and emit
+# ---------------------------------------------------------------------------
+line="$(jq -cn \
+    --arg     ts                    "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+    --argjson mem_usage_bytes       "$mem_usage_bytes" \
+    --argjson mem_pct               "$mem_pct" \
+    --argjson cpu_pct               "$cpu_pct" \
+    --argjson restart_count         "$restart_count" \
+    --argjson oom_killed            "$oom_killed" \
+    --argjson s3_file_count         "$s3_file_count" \
+    --arg     s3_newest_file        "$s3_newest_file" \
+    --arg     last_batch_ts        "$last_batch_ts" \
+    --argjson batch_count_60s      "$batch_count" \
+    --argjson s3_put_failed_count_60s "$put_fail_count" \
+    '{
+        ts:                      $ts,
+        mem_usage_bytes:         $mem_usage_bytes,
+        mem_pct:                 $mem_pct,
+        cpu_pct:                 $cpu_pct,
+        restart_count:           $restart_count,
+        oom_killed:              $oom_killed,
+        s3_file_count:           $s3_file_count,
+        s3_newest_file:          ($s3_newest_file | if . == "" then null else . end),
+        last_batch_ts:           ($last_batch_ts | if . == "" then null else . end),
+        batch_count_60s:         $batch_count_60s,
+        s3_put_failed_count_60s: $s3_put_failed_count_60s
+    }')"
+
+echo "$line"
+{ echo "$line" >> "$S3_LOG"; } 2>/dev/null || true

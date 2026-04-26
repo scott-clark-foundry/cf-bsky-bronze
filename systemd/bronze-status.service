@@ -1,0 +1,18 @@
+[Unit]
+Description=Bronze ingest status snapshot
+After=network.target
+
+[Service]
+Type=oneshot
+# `+` runs as root regardless of User=. touch creates the log file if absent
+# and otherwise just updates mtime (does NOT truncate). chown ensures deploy
+# can append. Without these, /var/log/ is root-owned and deploy's `>> $LOG`
+# in the script silently no-ops on first run.
+ExecStartPre=+/bin/touch /var/log/bronze-status.jsonl
+ExecStartPre=+/bin/chown deploy:deploy /var/log/bronze-status.jsonl
+ExecStart=/opt/cf-bsky-bronze/bin/bronze-status
+EnvironmentFile=/opt/cf-bsky-bronze/.env
+User=deploy
+
+[Install]
+WantedBy=multi-user.target
