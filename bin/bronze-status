@@ -145,13 +145,13 @@ if command -v docker &>/dev/null && command -v jq &>/dev/null; then
         fi
 
         # count batch flush events (full or sub-full) in last 60s.
-        # `jq -r select(...) | wc -l` counts matches because structlog's
-        # JSONRenderer emits one object per line — if that ever switches to
-        # indented JSON, this count would inflate (one match → many lines).
-        batch_count="$(echo "$logs_60s" | jq -r 'select(type=="object" and (.event=="batch_full" or .event=="batch_written"))' 2>/dev/null | wc -l | tr -d ' ' || echo "0")"
+        # `-c` (compact output) is load-bearing: jq's default rendering of
+        # an object spans multiple lines, which would inflate `wc -l` by ~9×
+        # per match regardless of how the input was shaped.
+        batch_count="$(echo "$logs_60s" | jq -c 'select(type=="object" and (.event=="batch_full" or .event=="batch_written"))' 2>/dev/null | wc -l | tr -d ' ' || echo "0")"
 
         # count s3_put_failed events in last 60s
-        put_fail_count="$(echo "$logs_60s" | jq -r 'select(type=="object" and .event=="s3_put_failed")' 2>/dev/null | wc -l | tr -d ' ' || echo "0")"
+        put_fail_count="$(echo "$logs_60s" | jq -c 'select(type=="object" and .event=="s3_put_failed")' 2>/dev/null | wc -l | tr -d ' ' || echo "0")"
     fi
 fi
 
